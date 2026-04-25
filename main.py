@@ -26,14 +26,44 @@ IMAGE_NET_STD = (0.229, 0.224, 0.225)
 class ModelConfig:
     name: str
     image_size: tuple[int, int]  # (height, width)
+    architecture: str
     channels: tuple[int, ...]
-    paper_fc_features: int
+    paper_fc_features: Optional[int] = None
+    description: str = ""
 
 
 MODEL_CONFIGS = {
-    "cnn5": ModelConfig("cnn5", image_size=(32, 15), channels=(64, 128), paper_fc_features=15360),
-    "cnn20": ModelConfig("cnn20", image_size=(64, 60), channels=(64, 128, 256), paper_fc_features=46080),
-    "cnn60": ModelConfig("cnn60", image_size=(96, 180), channels=(64, 128, 256, 512), paper_fc_features=184320),
+    "cnn5": ModelConfig(
+        "cnn5",
+        image_size=(32, 15),
+        architecture="paper",
+        channels=(64, 128),
+        paper_fc_features=15360,
+        description="5-day CNN baseline from Figure 3.",
+    ),
+    "cnn20": ModelConfig(
+        "cnn20",
+        image_size=(64, 60),
+        architecture="paper",
+        channels=(64, 128, 256),
+        paper_fc_features=46080,
+        description="20-day CNN baseline from Figure 3.",
+    ),
+    "cnn60": ModelConfig(
+        "cnn60",
+        image_size=(96, 180),
+        architecture="paper",
+        channels=(64, 128, 256, 512),
+        paper_fc_features=184320,
+        description="60-day CNN baseline from Figure 3.",
+    ),
+    "res_se_cnn": ModelConfig(
+        "res_se_cnn",
+        image_size=(96, 180),
+        architecture="residual_se",
+        channels=(32, 64, 128, 256),
+        description="Stronger custom residual CNN with BatchNorm, SE attention, dropout, and global pooling.",
+    ),
 }
 
 METRIC_FIELDS = [
@@ -213,23 +243,129 @@ class PaperCNN(nn.Module):
         return self.classifier(x)
 
 
-def build_model(model_name: str) -> PaperCNN:
+class ConvBNAct(nn.Sequential):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: tuple[int, int] = (3, 3),
+        stride: tuple[int, int] = (1, 1),
+        padding: tuple[int, int] = (1, 1),
+    ) -> None:
+        super().__init__(
+            nn.Conv2d(
+                in_channels,
+                out_channels,
+                kernel_size=kernel_size,
+                stride=stride,
+                padding=padding,
+                bias=False,
+            ),
+            nn.BatchNorm2d(out_channels),
+            nn.SiLU(inplace=True),
+        )
+
+
+class SqueezeExcitation(nn.Module):
+    def __init__(self, channels: int, reduction: int = 16) -> None:
+        super().__init__()
+        hidden_channels = max(8, channels // reduction)
+        self.attention = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),
+            nn.Conv2d(channels, hidden_channels, kernel_size=1),
+            nn.SiLU(inplace=True),
+            nn.Conv2d(hidden_channels, channels, kernel_size=1),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.attention(x)
+
+
+class ResidualSEBlock(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, stride: tuple[int, int] = (1, 1)) -> None:
+        super().__init__()
+        self.conv1 = ConvBNAct(in_channels, out_channels, stride=stride)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(out_channels),
+        )
+        self.se = SqueezeExcitation(out_channels)
+        if in_channels != out_channels or stride != (1, 1):
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.se(x)
+        return self.activation(x + residual)
+
+
+class ResidualSEPriceCNN(nn.Module):
+    """Custom model for full 96x180 price-trend images."""
+
+    def __init__(self, config: ModelConfig, num_classes: int = 2) -> None:
+        super().__init__()
+        self.config = config
+        c0, c1, c2, c3 = config.channels
+        self.features = nn.Sequential(
+            ConvBNAct(3, c0, kernel_size=(5, 3), padding=(2, 1)),
+            ResidualSEBlock(c0, c1, stride=(2, 2)),
+            ResidualSEBlock(c1, c1),
+            ResidualSEBlock(c1, c2, stride=(2, 2)),
+            ResidualSEBlock(c2, c2),
+            ResidualSEBlock(c2, c3, stride=(2, 2)),
+            ResidualSEBlock(c3, c3),
+        )
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=0.35),
+            nn.Linear(c3, 128),
+            nn.SiLU(inplace=True),
+            nn.Dropout(p=0.20),
+            nn.Linear(128, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x)
+        return self.classifier(x)
+
+
+def build_model(model_name: str) -> nn.Module:
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model {model_name}; choose from {sorted(MODEL_CONFIGS)}")
-    return PaperCNN(MODEL_CONFIGS[model_name])
+    config = MODEL_CONFIGS[model_name]
+    if config.architecture == "paper":
+        return PaperCNN(config)
+    if config.architecture == "residual_se":
+        return ResidualSEPriceCNN(config)
+    raise ValueError(f"Unknown architecture for {model_name}: {config.architecture}")
 
 
 def model_names_from_arg(model_arg: str) -> list[str]:
+    if model_arg == "paper":
+        return [name for name, config in MODEL_CONFIGS.items() if config.architecture == "paper"]
     return list(MODEL_CONFIGS) if model_arg == "all" else [model_arg]
 
 
 def model_config_payload(config: ModelConfig, actual_features: int) -> dict[str, object]:
     return {
         "name": config.name,
+        "architecture": config.architecture,
         "image_size": list(config.image_size),
         "channels": list(config.channels),
-        "actual_flatten_features": actual_features,
+        "feature_map_elements_before_classifier": actual_features,
         "paper_fc_label": config.paper_fc_features,
+        "description": config.description,
     }
 
 
@@ -404,7 +540,12 @@ def make_run_dir(args: argparse.Namespace, model_name: str) -> Path:
         name = sanitize_name(
             f"{timestamp}_{model_name}_lr{args.lr}_bs{args.batch_size}_split{args.val_split}_vr{args.val_ratio}"
         )
-    run_dir = Path(args.output_dir) / name
+    base_dir = Path(args.output_dir) / name
+    run_dir = base_dir
+    suffix = 1
+    while run_dir.exists():
+        run_dir = Path(args.output_dir) / f"{name}_{timestamp}_{suffix}"
+        suffix += 1
     run_dir.mkdir(parents=True, exist_ok=False)
     return run_dir
 
@@ -452,7 +593,7 @@ def smoke_check(args: argparse.Namespace, device: torch.device) -> None:
         logits = model(images.to(device))
         print(
             f"{model_name}: input={tuple(images.shape)} logits={tuple(logits.shape)} "
-            f"flatten_features={actual_features} paper_fc_label={config.paper_fc_features} "
+            f"feature_map_elements={actual_features} paper_fc_label={config.paper_fc_features} "
             f"labels={labels.tolist()}"
         )
 
@@ -483,7 +624,7 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
     print(f"device: {device}")
     print(f"model: {model_name}")
     print(f"image_size: {config.image_size}")
-    print(f"flatten_features: {actual_features}; paper_fc_label: {config.paper_fc_features}")
+    print(f"feature_map_elements: {actual_features}; paper_fc_label: {config.paper_fc_features}")
     print(f"train/val/test: {len(train_split)}/{len(val_split)}/{len(test_samples)}")
     print(f"run_dir: {run_dir}")
 
@@ -620,7 +761,7 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CNN baselines for DL Finance Project 1.")
     parser.add_argument("--data-dir", default=str(DATA_DIR), help="Path containing image/train and image/test folders.")
-    parser.add_argument("--model", choices=["all", *MODEL_CONFIGS.keys()], default="cnn60")
+    parser.add_argument("--model", choices=["paper", "all", *MODEL_CONFIGS.keys()], default="cnn60")
     parser.add_argument("--epochs", type=int, default=0, help="Use 0 for a dataset/model smoke check only.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)

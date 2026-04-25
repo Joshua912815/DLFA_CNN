@@ -9,7 +9,8 @@
   - test/0: 20,814
   - test/1: 22,067
 - 处理图像通道问题：图片是 `RGBA`，而 starter code 的 Normalize 只给了 3 通道参数；需要统一转成 `RGB` 或改成 4 通道处理。
-- 检查本地环境：当前 `torchvision` 缺失，运行前需要安装或切换到课程平台环境。
+- 检查运行环境：优先使用服务器/本地 `mcts` conda 环境；代码按 `cuda -> mps -> cpu` 自动选择设备。
+- 维护 `requirements.txt`，便于团队在新环境复现实验依赖。
 
 ## 2. 实现可运行 Baseline
 
@@ -30,6 +31,7 @@
   - 输出 train loss / train accuracy。
   - 输出 validation loss / validation accuracy。
   - 根据 validation accuracy 或 validation loss 保存最佳模型权重和实验日志。
+  - 每次实验保存 `config.json`、`split_summary.json`、`metrics.csv`、最佳/最新 checkpoint、训练曲线和混淆矩阵到独立 run 目录。
   - 在所有模型与超参数确定后，最后只对最佳模型运行一次 2013 test set 评估。
 
 ## 3. 复现或参考论文 CNN 结构
@@ -46,12 +48,11 @@
 ## 4. 做实验对比
 
 - 至少跑通这些实验：
-  - 简单 CNN baseline。
-  - 参考论文结构 CNN。
+  - PDF Figure 3 的 `cnn5`、`cnn20`、`cnn60` 三个 baseline。
+  - 自定义增强模型 `res_se_cnn`：使用 96x180 全图输入，包含 BatchNorm、残差连接、SE channel attention、Dropout 和 global average pooling。
   - 调整 learning rate。
   - 调整 batch size。
-  - 调整 CNN depth / channel 数。
-  - 可选：ResNet18 或轻量 ResNet。
+  - 调整 weight decay 和 epoch 数。
 - 建议记录每组实验：
   - 模型结构。
   - optimizer。
