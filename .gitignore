@@ -6,6 +6,9 @@ yarn-error.log*
 
 # Logs
 logs/
+runs/
+project1/
+.matplotlib-cache/
 *.log
 *.tlog
 *.out
