@@ -49,10 +49,18 @@
 
 - 至少跑通这些实验：
   - PDF Figure 3 的 `cnn5`、`cnn20`、`cnn60` 三个 baseline。
-  - 自定义增强模型 `res_se_cnn`：使用 96x180 全图输入，包含 BatchNorm、残差连接、SE channel attention、Dropout 和 global average pooling。
+  - 自定义增强模型 `res_se_cnn`：使用 96x180 全图输入，包含 GroupNorm、残差连接、SE channel attention、Dropout 和 global average pooling。
+  - Advanced CNN 尝试：
+    - `resnet18_scratch`：torchvision ResNet18，从零训练，2 类输出。
+    - `chart_resnet18_gn`：针对价格趋势图改造的 ResNet18，使用 5x3 stem、移除初始 max-pool、GroupNorm 和 Dropout。
+    - `chart_resnet18_se`：在 `chart_resnet18_gn` 上加入 SE channel attention。
+  - 对自定义模型优先使用稳定训练配置：AdamW、较低学习率、cosine scheduler、label smoothing 和 gradient clipping。
+  - 增加保守输入尝试：`--normalization imagenet|dataset|none`，以及只包含 brightness/contrast jitter 和 random erasing 的 `--augmentation light`。
+  - 开启 early stopping，最终报告使用 validation 最佳 checkpoint，而不是最后一个 epoch。
   - 调整 learning rate。
   - 调整 batch size。
   - 调整 weight decay 和 epoch 数。
+  - 使用 `summarize_results.py` 汇总所有 run 的 validation 指标，生成报告表格。
 - 建议记录每组实验：
   - 模型结构。
   - optimizer。
@@ -62,6 +70,7 @@
   - train accuracy。
   - validation accuracy。
   - validation precision / recall / confusion matrix。
+  - 是否使用 dataset normalization、light augmentation、label smoothing。
 - 禁止用 2013 年 test accuracy 反复挑选模型或超参数，避免 look-ahead bias 和数据泄露。
 - 最终模型确定后，只记录一次 test accuracy，并在报告中明确说明 test set 没有参与调参。
 - 原论文给出的参考精度大约在 50% 到 54% 区间；报告中不要只追求很高 accuracy，要解释金融预测任务本身信号弱。
@@ -78,6 +87,7 @@
   - 至少一张结果表。
   - confusion matrix / precision / recall 等辅助分析。
   - 不同模型结构、超参数对结果的影响。
+  - advanced CNN / ResNet 尝试的结果分析，包括没有提升或不稳定的模型。
   - CNN 图像方法预测股票收益的优缺点。
   - 所有尝试，包括失败或效果不好的尝试。
   - 如借鉴开源代码，明确说明来源。

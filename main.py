@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageEnhance
 
 import torch
 import torch.nn as nn
@@ -62,12 +62,34 @@ MODEL_CONFIGS = {
         image_size=(96, 180),
         architecture="residual_se",
         channels=(32, 64, 128, 256),
-        description="Stronger custom residual CNN with BatchNorm, SE attention, dropout, and global pooling.",
+        description="Stronger custom residual CNN with GroupNorm, SE attention, dropout, and global pooling.",
+    ),
+    "resnet18_scratch": ModelConfig(
+        "resnet18_scratch",
+        image_size=(96, 180),
+        architecture="torchvision_resnet18",
+        channels=(64, 128, 256, 512),
+        description="Torchvision ResNet18 trained from scratch on 96x180 price-trend images.",
+    ),
+    "chart_resnet18_gn": ModelConfig(
+        "chart_resnet18_gn",
+        image_size=(96, 180),
+        architecture="chart_resnet18_gn",
+        channels=(32, 64, 128, 256),
+        description="Price-chart ResNet18 variant with a 5x3 stride-1 stem, no initial max-pool, GroupNorm, and dropout.",
+    ),
+    "chart_resnet18_se": ModelConfig(
+        "chart_resnet18_se",
+        image_size=(96, 180),
+        architecture="chart_resnet18_se",
+        channels=(32, 64, 128, 256),
+        description="Chart ResNet18 with GroupNorm plus squeeze-and-excitation attention in each residual block.",
     ),
 }
 
 METRIC_FIELDS = [
     "epoch",
+    "learning_rate",
     "train_loss",
     "train_accuracy",
     "val_loss",
@@ -182,6 +204,51 @@ def limit_samples(samples: list[tuple[Path, int, str]], limit: Optional[int]) ->
     return sorted(selected[:limit], key=lambda item: (item[2], str(item[0])))
 
 
+def resolve_normalization(
+    mode: str,
+    samples: list[tuple[Path, int, str]],
+    image_size: tuple[int, int],
+    max_samples: int,
+    seed: int,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    if mode == "imagenet":
+        return IMAGE_NET_MEAN, IMAGE_NET_STD
+    if mode == "none":
+        return (0.0, 0.0, 0.0), (1.0, 1.0, 1.0)
+    if mode != "dataset":
+        raise ValueError("--normalization must be one of imagenet, dataset, none")
+    return estimate_dataset_normalization(samples, image_size, max_samples=max_samples, seed=seed)
+
+
+def estimate_dataset_normalization(
+    samples: list[tuple[Path, int, str]],
+    image_size: tuple[int, int],
+    max_samples: int,
+    seed: int,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    if max_samples <= 0 or max_samples >= len(samples):
+        selected = samples
+    else:
+        rng = random.Random(seed)
+        selected = rng.sample(samples, max_samples)
+
+    channel_sum = np.zeros(3, dtype=np.float64)
+    channel_squared_sum = np.zeros(3, dtype=np.float64)
+    pixel_count = 0
+    for path, _, _ in selected:
+        image = Image.open(path).convert("RGB")
+        image = image.resize((image_size[1], image_size[0]), _bilinear_resample())
+        array = np.asarray(image, dtype=np.float32) / 255.0
+        channel_sum += array.sum(axis=(0, 1))
+        channel_squared_sum += np.square(array).sum(axis=(0, 1))
+        pixel_count += array.shape[0] * array.shape[1]
+
+    mean = channel_sum / pixel_count
+    variance = np.maximum(channel_squared_sum / pixel_count - np.square(mean), 1e-12)
+    std = np.sqrt(variance)
+    return tuple(float(value) for value in mean), tuple(float(value) for value in std)
+
+
 class PriceTrendImageDataset(Dataset):
     def __init__(
         self,
@@ -189,11 +256,13 @@ class PriceTrendImageDataset(Dataset):
         image_size: tuple[int, int],
         mean: tuple[float, float, float] = IMAGE_NET_MEAN,
         std: tuple[float, float, float] = IMAGE_NET_STD,
+        augmentation: str = "none",
     ) -> None:
         self.samples = samples
         self.image_size = image_size
         self.mean = torch.tensor(mean, dtype=torch.float32).view(3, 1, 1)
         self.std = torch.tensor(std, dtype=torch.float32).view(3, 1, 1)
+        self.augmentation = augmentation
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -202,10 +271,30 @@ class PriceTrendImageDataset(Dataset):
         path, label, _ = self.samples[index]
         image = Image.open(path).convert("RGB")
         image = image.resize((self.image_size[1], self.image_size[0]), _bilinear_resample())
-        array = np.asarray(image, dtype=np.float32) / 255.0
+        if self.augmentation == "light":
+            image = self._light_augment(image)
+        array = np.array(image, dtype=np.float32) / 255.0
+        if self.augmentation == "light" and random.random() < 0.25:
+            self._apply_random_erasing(array)
         tensor = torch.from_numpy(array).permute(2, 0, 1)
         tensor = (tensor - self.mean) / self.std
         return tensor, torch.tensor(label, dtype=torch.long)
+
+    @staticmethod
+    def _light_augment(image: Image.Image) -> Image.Image:
+        brightness = random.uniform(0.9, 1.1)
+        contrast = random.uniform(0.9, 1.1)
+        image = ImageEnhance.Brightness(image).enhance(brightness)
+        return ImageEnhance.Contrast(image).enhance(contrast)
+
+    @staticmethod
+    def _apply_random_erasing(array: np.ndarray) -> None:
+        height, width, _ = array.shape
+        erase_h = max(1, int(height * random.uniform(0.05, 0.18)))
+        erase_w = max(1, int(width * random.uniform(0.05, 0.18)))
+        top = random.randint(0, max(0, height - erase_h))
+        left = random.randint(0, max(0, width - erase_w))
+        array[top : top + erase_h, left : left + erase_w, :] = 0.0
 
 
 def _bilinear_resample() -> int:
@@ -243,7 +332,14 @@ class PaperCNN(nn.Module):
         return self.classifier(x)
 
 
-class ConvBNAct(nn.Sequential):
+def group_count(channels: int, max_groups: int = 8) -> int:
+    groups = min(max_groups, channels)
+    while channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+class ConvNormAct(nn.Sequential):
     def __init__(
         self,
         in_channels: int,
@@ -261,7 +357,7 @@ class ConvBNAct(nn.Sequential):
                 padding=padding,
                 bias=False,
             ),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(group_count(out_channels), out_channels),
             nn.SiLU(inplace=True),
         )
 
@@ -285,16 +381,16 @@ class SqueezeExcitation(nn.Module):
 class ResidualSEBlock(nn.Module):
     def __init__(self, in_channels: int, out_channels: int, stride: tuple[int, int] = (1, 1)) -> None:
         super().__init__()
-        self.conv1 = ConvBNAct(in_channels, out_channels, stride=stride)
+        self.conv1 = ConvNormAct(in_channels, out_channels, stride=stride)
         self.conv2 = nn.Sequential(
             nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
-            nn.BatchNorm2d(out_channels),
+            nn.GroupNorm(group_count(out_channels), out_channels),
         )
         self.se = SqueezeExcitation(out_channels)
         if in_channels != out_channels or stride != (1, 1):
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels),
+                nn.GroupNorm(group_count(out_channels), out_channels),
             )
         else:
             self.shortcut = nn.Identity()
@@ -316,7 +412,7 @@ class ResidualSEPriceCNN(nn.Module):
         self.config = config
         c0, c1, c2, c3 = config.channels
         self.features = nn.Sequential(
-            ConvBNAct(3, c0, kernel_size=(5, 3), padding=(2, 1)),
+            ConvNormAct(3, c0, kernel_size=(5, 3), padding=(2, 1)),
             ResidualSEBlock(c0, c1, stride=(2, 2)),
             ResidualSEBlock(c1, c1),
             ResidualSEBlock(c1, c2, stride=(2, 2)),
@@ -340,6 +436,114 @@ class ResidualSEPriceCNN(nn.Module):
         return self.classifier(x)
 
 
+class TorchvisionResNet18Scratch(nn.Module):
+    """Torchvision ResNet18 with random initialization and a 2-class head."""
+
+    def __init__(self, config: ModelConfig, num_classes: int = 2) -> None:
+        super().__init__()
+        self.config = config
+        try:
+            from torchvision.models import resnet18
+        except Exception as exc:  # pragma: no cover - depends on environment packaging.
+            raise RuntimeError("resnet18_scratch requires torchvision. Install requirements.txt first.") from exc
+
+        base = resnet18(weights=None)
+        self.features = nn.Sequential(
+            base.conv1,
+            base.bn1,
+            base.relu,
+            base.maxpool,
+            base.layer1,
+            base.layer2,
+            base.layer3,
+            base.layer4,
+        )
+        self.pool = base.avgpool
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=0.20),
+            nn.Linear(base.fc.in_features, num_classes),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x)
+        return self.classifier(x)
+
+
+class ChartResNetBlock(nn.Module):
+    expansion = 1
+
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        stride: tuple[int, int] = (1, 1),
+        use_se: bool = False,
+    ) -> None:
+        super().__init__()
+        self.conv1 = ConvNormAct(in_channels, out_channels, stride=stride)
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False),
+            nn.GroupNorm(group_count(out_channels), out_channels),
+        )
+        self.se = SqueezeExcitation(out_channels) if use_se else nn.Identity()
+        if in_channels != out_channels or stride != (1, 1):
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.GroupNorm(group_count(out_channels), out_channels),
+            )
+        else:
+            self.shortcut = nn.Identity()
+        self.activation = nn.SiLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.shortcut(x)
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.se(x)
+        return self.activation(x + residual)
+
+
+class ChartResNet18(nn.Module):
+    """ResNet18-style model adapted for sparse price-chart images."""
+
+    def __init__(self, config: ModelConfig, use_se: bool, num_classes: int = 2) -> None:
+        super().__init__()
+        self.config = config
+        c0, c1, c2, c3 = config.channels
+        self.stem = ConvNormAct(3, c0, kernel_size=(5, 3), stride=(1, 1), padding=(2, 1))
+        self.layer1 = self._make_layer(c0, c0, blocks=2, stride=(1, 1), use_se=use_se)
+        self.layer2 = self._make_layer(c0, c1, blocks=2, stride=(2, 2), use_se=use_se)
+        self.layer3 = self._make_layer(c1, c2, blocks=2, stride=(2, 2), use_se=use_se)
+        self.layer4 = self._make_layer(c2, c3, blocks=2, stride=(2, 2), use_se=use_se)
+        self.features = nn.Sequential(self.stem, self.layer1, self.layer2, self.layer3, self.layer4)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.classifier = nn.Sequential(
+            nn.Flatten(),
+            nn.Dropout(p=0.35),
+            nn.Linear(c3, num_classes),
+        )
+
+    @staticmethod
+    def _make_layer(
+        in_channels: int,
+        out_channels: int,
+        blocks: int,
+        stride: tuple[int, int],
+        use_se: bool,
+    ) -> nn.Sequential:
+        layers: list[nn.Module] = [ChartResNetBlock(in_channels, out_channels, stride=stride, use_se=use_se)]
+        for _ in range(1, blocks):
+            layers.append(ChartResNetBlock(out_channels, out_channels, use_se=use_se))
+        return nn.Sequential(*layers)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = self.pool(x)
+        return self.classifier(x)
+
+
 def build_model(model_name: str) -> nn.Module:
     if model_name not in MODEL_CONFIGS:
         raise ValueError(f"Unknown model {model_name}; choose from {sorted(MODEL_CONFIGS)}")
@@ -348,12 +552,20 @@ def build_model(model_name: str) -> nn.Module:
         return PaperCNN(config)
     if config.architecture == "residual_se":
         return ResidualSEPriceCNN(config)
+    if config.architecture == "torchvision_resnet18":
+        return TorchvisionResNet18Scratch(config)
+    if config.architecture == "chart_resnet18_gn":
+        return ChartResNet18(config, use_se=False)
+    if config.architecture == "chart_resnet18_se":
+        return ChartResNet18(config, use_se=True)
     raise ValueError(f"Unknown architecture for {model_name}: {config.architecture}")
 
 
 def model_names_from_arg(model_arg: str) -> list[str]:
     if model_arg == "paper":
         return [name for name, config in MODEL_CONFIGS.items() if config.architecture == "paper"]
+    if model_arg == "advanced":
+        return ["resnet18_scratch", "chart_resnet18_gn", "chart_resnet18_se"]
     return list(MODEL_CONFIGS) if model_arg == "all" else [model_arg]
 
 
@@ -376,8 +588,17 @@ def make_dataloader(
     shuffle: bool,
     num_workers: int,
     device: torch.device,
+    mean: tuple[float, float, float] = IMAGE_NET_MEAN,
+    std: tuple[float, float, float] = IMAGE_NET_STD,
+    augmentation: str = "none",
 ) -> DataLoader:
-    dataset = PriceTrendImageDataset(samples=samples, image_size=config.image_size)
+    dataset = PriceTrendImageDataset(
+        samples=samples,
+        image_size=config.image_size,
+        mean=mean,
+        std=std,
+        augmentation=augmentation,
+    )
     return DataLoader(
         dataset,
         batch_size=batch_size,
@@ -393,6 +614,7 @@ def train_one_epoch(
     criterion: nn.Module,
     optimizer: torch.optim.Optimizer,
     device: torch.device,
+    grad_clip: float,
 ) -> tuple[float, float]:
     model.train()
     running_loss = 0.0
@@ -407,6 +629,8 @@ def train_one_epoch(
         logits = model(images)
         loss = criterion(logits, labels)
         loss.backward()
+        if grad_clip > 0:
+            nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
         optimizer.step()
 
         batch_size = labels.size(0)
@@ -550,6 +774,29 @@ def make_run_dir(args: argparse.Namespace, model_name: str) -> Path:
     return run_dir
 
 
+def build_optimizer(args: argparse.Namespace, model: nn.Module) -> torch.optim.Optimizer:
+    if args.optimizer == "adam":
+        return torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        return torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    raise ValueError(f"Unsupported optimizer: {args.optimizer}")
+
+
+def build_scheduler(
+    args: argparse.Namespace,
+    optimizer: torch.optim.Optimizer,
+) -> Optional[torch.optim.lr_scheduler.LRScheduler]:
+    if args.scheduler == "none":
+        return None
+    if args.scheduler == "cosine":
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs),
+            eta_min=args.min_lr,
+        )
+    raise ValueError(f"Unsupported scheduler: {args.scheduler}")
+
+
 def initialize_lazy_layers(model: nn.Module, config: ModelConfig, device: torch.device) -> int:
     model.eval()
     dummy = torch.zeros(1, 3, config.image_size[0], config.image_size[1], device=device)
@@ -572,9 +819,16 @@ def smoke_check(args: argparse.Namespace, device: torch.device) -> None:
     print(f"validation samples: {len(val_split)}")
     print(f"test samples: {len(test_samples)}")
 
-    model_names = list(MODEL_CONFIGS) if args.model == "all" else [args.model]
+    model_names = model_names_from_arg(args.model)
     for model_name in model_names:
         config = MODEL_CONFIGS[model_name]
+        mean, std = resolve_normalization(
+            args.normalization,
+            train_split,
+            config.image_size,
+            args.normalization_samples,
+            args.seed,
+        )
         model = build_model(model_name).to(device)
         actual_features = initialize_lazy_layers(model, config, device)
         batch = next(
@@ -586,6 +840,8 @@ def smoke_check(args: argparse.Namespace, device: torch.device) -> None:
                     shuffle=False,
                     num_workers=0,
                     device=device,
+                    mean=mean,
+                    std=std,
                 )
             )
         )
@@ -594,7 +850,8 @@ def smoke_check(args: argparse.Namespace, device: torch.device) -> None:
         print(
             f"{model_name}: input={tuple(images.shape)} logits={tuple(logits.shape)} "
             f"feature_map_elements={actual_features} paper_fc_label={config.paper_fc_features} "
-            f"labels={labels.tolist()}"
+            f"normalization_mean={[round(value, 4) for value in mean]} "
+            f"normalization_std={[round(value, 4) for value in std]} labels={labels.tolist()}"
         )
 
 
@@ -607,9 +864,45 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
     val_split = limit_samples(val_split, args.limit_val_samples)
     test_samples = limit_samples(test_samples, args.limit_test_samples)
 
-    train_loader = make_dataloader(train_split, config, args.batch_size, True, args.num_workers, device)
-    val_loader = make_dataloader(val_split, config, args.batch_size, False, args.num_workers, device)
-    test_loader = make_dataloader(test_samples, config, args.batch_size, False, args.num_workers, device)
+    mean, std = resolve_normalization(
+        args.normalization,
+        train_split,
+        config.image_size,
+        args.normalization_samples,
+        args.seed,
+    )
+
+    train_loader = make_dataloader(
+        train_split,
+        config,
+        args.batch_size,
+        True,
+        args.num_workers,
+        device,
+        mean=mean,
+        std=std,
+        augmentation=args.augmentation,
+    )
+    val_loader = make_dataloader(
+        val_split,
+        config,
+        args.batch_size,
+        False,
+        args.num_workers,
+        device,
+        mean=mean,
+        std=std,
+    )
+    test_loader = make_dataloader(
+        test_samples,
+        config,
+        args.batch_size,
+        False,
+        args.num_workers,
+        device,
+        mean=mean,
+        std=std,
+    )
 
     model = build_model(model_name).to(device)
     actual_features = initialize_lazy_layers(model, config, device)
@@ -624,6 +917,8 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
     print(f"device: {device}")
     print(f"model: {model_name}")
     print(f"image_size: {config.image_size}")
+    print(f"normalization: {args.normalization}; mean={mean}; std={std}")
+    print(f"augmentation: {args.augmentation}")
     print(f"feature_map_elements: {actual_features}; paper_fc_label: {config.paper_fc_features}")
     print(f"train/val/test: {len(train_split)}/{len(val_split)}/{len(test_samples)}")
     print(f"run_dir: {run_dir}")
@@ -635,6 +930,13 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
             "model": model_name,
             "device": str(device),
             "model_config": model_config_payload(config, actual_features),
+            "normalization": {
+                "mode": args.normalization,
+                "mean": list(mean),
+                "std": list(std),
+                "sample_cap": args.normalization_samples if args.normalization == "dataset" else None,
+            },
+            "augmentation": args.augmentation,
         },
     )
     write_json(
@@ -662,23 +964,34 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
         },
     )
 
-    criterion = nn.CrossEntropyLoss()
-    optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+    optimizer = build_optimizer(args, model)
+    scheduler = build_scheduler(args, optimizer)
 
     log_path = metrics_dir / "metrics.csv"
     checkpoint_path = checkpoint_dir / "best.pt"
     latest_checkpoint_path = checkpoint_dir / "latest.pt"
 
     best_val_accuracy = -1.0
+    stale_epochs = 0
     with log_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=METRIC_FIELDS)
         writer.writeheader()
 
         for epoch in range(1, args.epochs + 1):
-            train_loss, train_accuracy = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            current_lr = optimizer.param_groups[0]["lr"]
+            train_loss, train_accuracy = train_one_epoch(
+                model,
+                train_loader,
+                criterion,
+                optimizer,
+                device,
+                args.grad_clip,
+            )
             val_metrics = evaluate(model, val_loader, criterion, device)
             row = {
                 "epoch": epoch,
+                "learning_rate": current_lr,
                 "train_loss": train_loss,
                 "train_accuracy": train_accuracy,
                 "val_loss": val_metrics["loss"],
@@ -696,8 +1009,10 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
                 f"val_precision={val_metrics['precision']:.4f} val_recall={val_metrics['recall']:.4f}"
             )
 
-            if float(val_metrics["accuracy"]) > best_val_accuracy:
+            improved = float(val_metrics["accuracy"]) > best_val_accuracy + args.early_stop_min_delta
+            if improved:
                 best_val_accuracy = float(val_metrics["accuracy"])
+                stale_epochs = 0
                 torch.save(
                     {
                         "model": model_name,
@@ -710,6 +1025,8 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
                     checkpoint_path,
                 )
                 write_json(metrics_dir / "best_validation_metrics.json", {"epoch": epoch, **val_metrics})
+            else:
+                stale_epochs += 1
 
             torch.save(
                 {
@@ -722,6 +1039,14 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
                 },
                 latest_checkpoint_path,
             )
+            if scheduler is not None:
+                scheduler.step()
+            if args.early_stop_patience > 0 and stale_epochs >= args.early_stop_patience:
+                print(
+                    f"early stopping at epoch {epoch:03d}: "
+                    f"best_val_acc={best_val_accuracy:.4f}, stale_epochs={stale_epochs}"
+                )
+                break
 
     plot_training_curves(log_path, figures_dir / "training_curves.png")
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -761,11 +1086,21 @@ def train(args: argparse.Namespace, device: torch.device, model_name: str) -> No
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="CNN baselines for DL Finance Project 1.")
     parser.add_argument("--data-dir", default=str(DATA_DIR), help="Path containing image/train and image/test folders.")
-    parser.add_argument("--model", choices=["paper", "all", *MODEL_CONFIGS.keys()], default="cnn60")
+    parser.add_argument("--model", choices=["paper", "advanced", "all", *MODEL_CONFIGS.keys()], default="cnn60")
     parser.add_argument("--epochs", type=int, default=0, help="Use 0 for a dataset/model smoke check only.")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=0.0)
+    parser.add_argument("--optimizer", choices=["adam", "adamw"], default="adam")
+    parser.add_argument("--scheduler", choices=["none", "cosine"], default="none")
+    parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--label-smoothing", type=float, default=0.0)
+    parser.add_argument("--grad-clip", type=float, default=0.0)
+    parser.add_argument("--normalization", choices=["imagenet", "dataset", "none"], default="imagenet")
+    parser.add_argument("--normalization-samples", type=int, default=4096, help="Training samples used to estimate dataset normalization; <=0 uses all samples.")
+    parser.add_argument("--augmentation", choices=["none", "light"], default="none", help="Training-only conservative pixel augmentation.")
+    parser.add_argument("--early-stop-patience", type=int, default=0, help="Stop after N epochs without validation accuracy improvement; 0 disables it.")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0)
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--val-split", choices=["time", "stratified"], default="time")
     parser.add_argument("--seed", type=int, default=42)
